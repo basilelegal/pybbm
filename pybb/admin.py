@@ -4,6 +4,7 @@ from django.utils.translation import ugettext_lazy as _
 from django.contrib import admin
 from django.core.urlresolvers import reverse
 
+from pybb import permissions
 from pybb.models import Category, Forum, Topic, Post, Profile, Attachment, PollAnswer
 
 from pybb import compat, util
@@ -40,10 +41,19 @@ class ForumAdmin(admin.ModelAdmin):
          ),
         (_('Additional options'), {
                 'classes': ('collapse',),
-                'fields': ('updated', 'description', 'headline', 'post_count', 'moderators')
+                'fields': ('updated', 'description', 'headline', 'post_count')
                 }
             ),
         )
+
+    def get_form(self, request, obj=None, **kwargs):
+        """
+        adds moderators field to Additionnal options fieldset only if
+        the request user has permission to manage moderators
+        """
+        if permissions.perms.may_manage_moderators(request.user):
+            self.fieldsets[1][1]['fields'] += ('moderators',)
+        return super(ForumAdmin, self).get_form(request, obj, **kwargs)
 
 
 class PollAnswerAdmin(admin.TabularInline):
