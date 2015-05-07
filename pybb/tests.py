@@ -31,7 +31,10 @@ except ImportError:
     raise Exception('PyBB requires lxml for self testing')
 
 from pybb import defaults
-from pybb.models import Topic, TopicReadTracker, Forum, ForumReadTracker, Post, Category, PollAnswer, Profile
+from pybb.models import Topic, TopicReadTracker, Forum, ForumReadTracker, Post, Category, PollAnswer
+
+
+Profile = util.get_pybb_profile_model()
 
 __author__ = 'zeus'
 
@@ -150,6 +153,48 @@ class FeaturesTest(TestCase, SharedTestModule):
         response = self.client.post(add_topic_url, data=values, follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertTrue(Topic.objects.filter(name='new topic name').exists())
+
+    def test_topic_read_before_post_addition(self):
+        """
+        Test if everything is okay when :
+            - user A create the topic
+            - but before associated post is created, user B display the forum
+        """
+        topic = Topic(name='xtopic', forum=self.forum, user=self.user)
+        topic.save()
+        #topic is saved, but post is not yet created at this time
+
+        #an other user is displaing the forum before the post creation
+        user_ann = User.objects.create_user('ann', 'ann@localhost', 'ann')
+        client = Client()
+        client.login(username='ann', password='ann')
+
+        self.assertEqual(client.get(topic.get_absolute_url()).status_code, 404)
+        self.assertEqual(topic.forum.post_count, 1)
+        self.assertEqual(topic.forum.topic_count, 1)
+        #do we need to correct this ?
+        #self.assertEqual(topic.forum.topics.count(), 1)
+        self.assertEqual(topic.post_count, 0)
+        
+        #Now, TopicReadTracker is not created because the topic detail view raise a 404
+        #If its creation is not finished. So we create it manually to add a test, just in case
+        #we have an other way where TopicReadTracker could be set for a not complete topic.
+        TopicReadTracker.objects.create(user=user_ann, topic=topic, time_stamp=topic.created)
+        
+        #before correction, raised TypeError: can't compare datetime.datetime to NoneType
+        pybb_topic_unread([topic,], user_ann)
+        
+        #before correction, raised IndexError: list index out of range
+        last_post = topic.last_post
+        
+        #post creation now.
+        Post(topic=topic, user=self.user, body='one').save()
+        
+        self.assertEqual(client.get(topic.get_absolute_url()).status_code, 200)
+        self.assertEqual(topic.forum.post_count, 2)
+        self.assertEqual(topic.forum.topic_count, 2)
+        self.assertEqual(topic.forum.topics.count(), 2)
+        self.assertEqual(topic.post_count, 1)
 
     def test_post_deletion(self):
         post = Post(topic=self.topic, user=self.user, body='bbcode [b]test[/b]')
@@ -859,8 +904,14 @@ class FeaturesTest(TestCase, SharedTestModule):
         user2 = User.objects.create_user(username='user2', password='user2', email='user2@someserver.com')
         user3 = User.objects.create_user(username='user3', password='user3', email='user3@example.com')
         client = Client()
+
         client.login(username='user2', password='user2')
-        response = client.get(reverse('pybb:add_subscription', args=[self.topic.id]), follow=True)
+        subscribe_url = reverse('pybb:add_subscription', args=[self.topic.id])
+        response = client.get(self.topic.get_absolute_url())
+        subscribe_links = html.fromstring(response.content).xpath('//a[@href="%s"]' % subscribe_url)
+        self.assertEqual(len(subscribe_links), 1)
+
+        response = client.get(subscribe_url, follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertIn(user2, self.topic.subscribers.all())
 
@@ -876,7 +927,7 @@ class FeaturesTest(TestCase, SharedTestModule):
         self.assertEqual(response.status_code, 200)
         new_post = Post.objects.order_by('-id')[0]
 
-        # there should only be one email in the outbox (to user2)
+        # there should only be one email in the outbox (to user2) because @example.com are ignored
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].to[0], user2.email)
         self.assertTrue([msg for msg in mail.outbox if new_post.get_absolute_url() in msg.body])
@@ -887,6 +938,75 @@ class FeaturesTest(TestCase, SharedTestModule):
         response = client.get(reverse('pybb:delete_subscription', args=[self.topic.id]), follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(user2, self.topic.subscribers.all())
+
+    def test_subscription_disabled(self):
+        orig_conf = defaults.PYBB_DISABLE_SUBSCRIPTIONS
+        defaults.PYBB_DISABLE_SUBSCRIPTIONS = True
+
+        user2 = User.objects.create_user(username='user2', password='user2', email='user2@someserver.com')
+        user3 = User.objects.create_user(username='user3', password='user3', email='user3@someserver.com')
+        client = Client()
+
+        client.login(username='user2', password='user2')
+        subscribe_url = reverse('pybb:add_subscription', args=[self.topic.id])
+        response = client.get(self.topic.get_absolute_url())
+        subscribe_links = html.fromstring(response.content).xpath('//a[@href="%s"]' % subscribe_url)
+        self.assertEqual(len(subscribe_links), 0)
+        
+        response = client.get(subscribe_url, follow=True)
+        self.assertEqual(response.status_code, 403)
+
+        self.topic.subscribers.add(user3)
+
+        # create a new reply (with another user)
+        self.client.login(username='zeus', password='zeus')
+        add_post_url = reverse('pybb:add_post', args=[self.topic.id])
+        response = self.client.get(add_post_url)
+        values = self.get_form_values(response)
+        values['body'] = 'test subscribtion юникод'
+        response = self.client.post(add_post_url, values, follow=True)
+        self.assertEqual(response.status_code, 200)
+        new_post = Post.objects.order_by('-id')[0]
+
+        # there should be one email in the outbox (user3)
+        #because already subscribed users will still receive notifications.
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to[0], user3.email)
+
+        defaults.PYBB_DISABLE_SUBSCRIPTIONS = orig_conf
+
+    def test_notifications_disabled(self):
+        orig_conf = defaults.PYBB_DISABLE_NOTIFICATIONS
+        defaults.PYBB_DISABLE_NOTIFICATIONS = True
+
+        user2 = User.objects.create_user(username='user2', password='user2', email='user2@someserver.com')
+        user3 = User.objects.create_user(username='user3', password='user3', email='user3@someserver.com')
+        client = Client()
+
+        client.login(username='user2', password='user2')
+        subscribe_url = reverse('pybb:add_subscription', args=[self.topic.id])
+        response = client.get(self.topic.get_absolute_url())
+        subscribe_links = html.fromstring(response.content).xpath('//a[@href="%s"]' % subscribe_url)
+        self.assertEqual(len(subscribe_links), 1)
+        response = client.get(subscribe_url, follow=True)
+        self.assertEqual(response.status_code, 200)
+
+        self.topic.subscribers.add(user3)
+
+        # create a new reply (with another user)
+        self.client.login(username='zeus', password='zeus')
+        add_post_url = reverse('pybb:add_post', args=[self.topic.id])
+        response = self.client.get(add_post_url)
+        values = self.get_form_values(response)
+        values['body'] = 'test subscribtion юникод'
+        response = self.client.post(add_post_url, values, follow=True)
+        self.assertEqual(response.status_code, 200)
+        new_post = Post.objects.order_by('-id')[0]
+
+        # there should be no email in the outbox
+        self.assertEqual(len(mail.outbox), 0)
+        
+        defaults.PYBB_DISABLE_NOTIFICATIONS = orig_conf
 
     def test_topic_updated(self):
         topic = Topic(name='etopic', forum=self.forum, user=self.user)
@@ -1076,6 +1196,7 @@ class AnonymousTest(TestCase, SharedTestModule):
         self.category = Category.objects.create(name='foo')
         self.forum = Forum.objects.create(name='xfoo', description='bar', category=self.category)
         self.topic = Topic.objects.create(name='etopic', forum=self.forum, user=self.user)
+        self.post = Post.objects.create(body='body post', topic=self.topic, user=self.user)
         add_post_permission = Permission.objects.get_by_natural_key('add_post', 'pybb', 'post')
         self.user.user_permissions.add(add_post_permission)
 
@@ -1915,3 +2036,18 @@ class LogonRedirectTest(TestCase, SharedTestModule):
         self.assertIsNotNone(profile)
         self.assertEqual(type(profile), util.get_pybb_profile_model())
         user.delete()
+
+    def test_user_delete_cascade(self):
+        user = User.objects.create_user('cronos', 'cronos@localhost', 'cronos')
+        profile = getattr(user, defaults.PYBB_PROFILE_RELATED_NAME, None)
+        self.assertIsNotNone(profile)
+        post = Post(topic=self.topic, user=user, body='I \'ll be back')
+        post.save()
+        user_pk = user.pk
+        profile_pk = profile.pk
+        post_pk = post.pk
+
+        user.delete()
+        self.assertFalse(User.objects.filter(pk=user_pk).exists())
+        self.assertFalse(Profile.objects.filter(pk=profile_pk).exists())
+        self.assertFalse(Post.objects.filter(pk=post_pk).exists())
